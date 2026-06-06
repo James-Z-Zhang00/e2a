@@ -22,6 +22,8 @@ make migrate            # apply SQL migrations to local DB
 
 Go tests that need the database use `E2A_TEST_DATABASE_URL="postgres://e2a:e2a@localhost:5433/e2a_test?sslmode=disable"`.
 
+Run a single Go test: `go test -run TestName ./internal/<pkg>/` (add `-tags integration` for e2e packages and export `E2A_TEST_DATABASE_URL` for DB-backed packages).
+
 **Outbound mail in dev (Mailpit catch-all).** `make docker-up` also starts [Mailpit](https://github.com/axllent/mailpit) — a single-binary SMTP server that captures every outbound message and exposes them at http://localhost:8025. The dockerized `e2a` service points at it automatically. For `make run` (host Go binary), uncomment the Mailpit block in `config.example.yaml`'s `outbound_smtp` section before copying to `config.yaml`, or set `E2A_OUTBOUND_SMTP_HOST=localhost`, `E2A_OUTBOUND_SMTP_PORT=1025`, `E2A_OUTBOUND_SMTP_FROM_DOMAIN=e2a.localhost`. Use this to exercise HITL approval notifications and the `/api/v1/agents/{email}/test` button locally without real SMTP creds.
 
 ### TypeScript SDK & CLI (npm workspaces)
@@ -32,6 +34,12 @@ npm test --workspace @e2a/sdk              # SDK unit tests (vitest)
 npm run test:contract --workspace @e2a/sdk # SDK contract tests (needs live server)
 npm test --workspace @e2a/cli              # CLI tests (vitest)
 npm run build --workspace @e2a/cli         # build CLI
+```
+
+### MCP server (`mcp/`, npm workspace)
+```bash
+npm run build --workspace @e2a/mcp-server  # tsc → dist/
+npm test --workspace @e2a/mcp-server       # vitest
 ```
 
 ### Python SDK
@@ -69,17 +77,27 @@ The main server (`cmd/e2a/main.go`) runs an SMTP relay and HTTP API. Key interna
 
 - **relay** — SMTP server, receives inbound email
 - **emailauth** — SPF/DKIM verification on inbound messages
+- **dkim** — DKIM signing of outbound mail (per-domain keys)
 - **agent** — Agent CRUD, API endpoints, routes
 - **identity** — Domain ownership verification and storage
 - **headers** — HMAC-SHA256 signing of `X-E2A-Auth-*` headers
 - **webhook** — HTTP POST delivery to agent endpoints with retry
+- **webhookpub** — publishes core events (relay, agent, HITL) to webhook subscribers
 - **ws** — WebSocket hub for real-time message push
 - **outbound** — Compose and send emails via upstream SMTP (SES)
-- **billing** — Stripe integration, usage metering
+- **loopback** — delivers agent-to-self messages without leaving the system
+- **hitlworker / hitlnotify / approvaltoken** — human-in-the-loop: periodic sweep that finalizes `pending_approval` sends, approval-notification email, and the short-lived HMAC magic-link tokens
+- **oauth** — OAuth 2 server (fosite) backing the MCP server and dashboard login
+- **usage** — usage metering / events
+- **limits / ratelimit** — per-account quotas and request rate limiting
+- **idempotency** — idempotency-key storage for safe retried writes
+- **telemetry** — metrics interface
 - **auth** — API key authentication
 - **config** — YAML config + env var overrides
 
 Inbound flow: SMTP → emailauth (SPF/DKIM) → agent lookup → headers signing → webhook or WebSocket delivery.
+
+Outbound flow: API call → optional HITL hold (`pending_approval`, finalized by hitlworker) → SMTP relay (agent-to-agent) or upstream SMTP / DKIM-signed (agent-to-human).
 
 ### SDK type generation pipeline
 
@@ -101,6 +119,10 @@ Commands: login, agents, domains, inbox, read, reply, send, listen, config. Conf
 ### Web (`web/`)
 
 Next.js 16 App Router with Tailwind CSS 4. In dev mode, rewrites `/api/*` to `localhost:8080`. Production builds as static export.
+
+### MCP server & Claude Code plugin (`mcp/`, `.claude-plugin/`, `skills/`)
+
+`mcp/` is the published `@e2a/mcp-server` — it exposes the HTTP API as MCP tools over streamable HTTP with OAuth (backed by the Go `oauth` package). The repo also ships a Claude Code plugin (`.claude-plugin/`) and the `using-e2a` skill (`skills/using-e2a/`).
 
 ### Contract tests
 
@@ -139,7 +161,7 @@ The first publish requires `@e2a/mcp-server` to be configured as a trusted publi
 
 ## Key Conventions
 
-- **npm workspaces**: root `package.json` declares `cli` and `sdks/typescript` as workspaces. Always use `--workspace` flag for workspace commands. Use `--package-lock=false` for install.
+- **npm workspaces**: root `package.json` declares `cli`, `sdks/typescript`, and `mcp` as workspaces (`web/` is a separate, non-workspace npm project). Always use `--workspace` flag for workspace commands. Use `--package-lock=false` for install.
 - **Go module**: `github.com/Mnexa-AI/e2a`, Go 1.25
 - **Go test tiers**: `test-unit` needs no DB. `test-integration` needs Postgres (runs identity/agent packages). `test-e2e` uses build tag `integration` and runs `internal/e2e/`. `make test` runs everything (including e2e) with `-tags integration -p 1`.
 - **Schema changes**: when changing a table shape, add or update DB-backed tests for every package that writes direct SQL against that table. Higher-level e2e tests are not enough. Our migration helper is idempotent and will not automatically catch old query assumptions if runtime SQL drifts from the redesigned schema.
